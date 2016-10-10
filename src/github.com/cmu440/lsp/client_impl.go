@@ -123,7 +123,7 @@ func (c *client) handleEvents() {
 				}
 				c.sendData(NewAck(c.connId, msg.SeqNum))
 			case MsgAck:
-				fmt.Println("***Received ack: " + msg.String())
+				//fmt.Println("***Received ack: " + msg.String())
 				if msg.SeqNum == 0 {
 					if !c.connected {
 						c.connected = true
@@ -144,7 +144,7 @@ func (c *client) handleEvents() {
 			c.outSeqNum++
 			msg := NewData(c.connId, c.outSeqNum, len(payload), payload)
 			//c.outMsgQueue.PushBack(msg)
-			fmt.Println("***Sending data: " + msg.String())
+			//fmt.Println("***Sending data: " + msg.String())
 			c.sendData(msg)
 		case <-c.connLost:
 			fmt.Println("Set the status to closed")
