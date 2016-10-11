@@ -3,32 +3,42 @@
 package lsp
 
 import (
-	"container/list"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
+	"time"
 )
 
 type client struct {
-	connected       bool
-	connId          int
-	outSeqNum       int
-	inMsgQueue      *list.List
-	outMsgQueue     *list.List
-	serverAddr      *lspnet.UDPAddr
-	conn            *lspnet.UDPConn
-	closed          bool
-	connAcked       chan bool
-	connLost        chan bool
+	params      *Params
+	connId      int
+	outSeqNum   int
+	inMsgQueue  *msgQueue
+	outMsgQueue *msgQueue
+	serverAddr  *lspnet.UDPAddr
+	conn        *lspnet.UDPConn
+
+	// Epoch
+	epochTicker *time.Ticker
+	epochCount  int
+
+	// Client Status
+	connected   bool
+	pendingRead bool // There is a Read request waiting to be responsed
+	closed      bool // Explicitly closed
+	connLost    bool // Connection lost due to timeout
+
+	// Channels
+	connSucceed     chan bool
+	connFail        chan bool
 	receiveMsg      chan *Message
 	requestRead     chan bool
-	pendingRead     bool
 	responseRead    chan *Message
 	requestWrite    chan []byte
 	requestClose    chan bool
-	quitReceiveData chan bool
 	readyToClose    chan bool
+	quitReceiveData chan bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -43,24 +53,28 @@ type client struct {
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
 	c := client{
-		false,
-		0,
-		0,
-		list.New(),
-		list.New(),
-		nil,
-		nil,
-		false,
-		make(chan bool),
-		make(chan bool),
-		make(chan *Message),
-		make(chan bool),
-		false,
-		make(chan *Message),
-		make(chan []byte),
-		make(chan bool),
-		make(chan bool),
-		make(chan bool),
+		params:          params,
+		connId:          0,
+		outSeqNum:       0,
+		inMsgQueue:      NewQueue(params.WindowSize),
+		outMsgQueue:     NewQueue(params.WindowSize),
+		serverAddr:      nil,
+		conn:            nil,
+		epochTicker:     nil,
+		epochCount:      0,
+		connected:       false,
+		pendingRead:     false,
+		closed:          false,
+		connLost:        false,
+		connSucceed:     make(chan bool),
+		connFail:        make(chan bool),
+		receiveMsg:      make(chan *Message),
+		requestRead:     make(chan bool),
+		responseRead:    make(chan *Message),
+		requestWrite:    make(chan []byte),
+		requestClose:    make(chan bool),
+		readyToClose:    make(chan bool),
+		quitReceiveData: make(chan bool, 2),
 	}
 
 	serverAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
@@ -78,34 +92,39 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, err
 	}
 
+	c.epochTicker = time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis))
+
 	go c.receiveData()
 	go c.handleEvents()
 
-	<-c.connAcked
-	return &c, nil
+	select {
+	case <-c.connSucceed:
+		return &c, nil
+	case <-c.connFail:
+		c.conn.Close()
+		return nil, errors.New("Timeout when trying to make connection")
+	}
 }
 
 func (c *client) receiveData() {
+	defer fmt.Println("Quit from receiveData()")
 	var buf [2000]byte
 	for {
 		select {
 		case <-c.quitReceiveData:
-			fmt.Println("Quit from receiveData()")
 			return
 		default:
+			n, _, err := c.conn.ReadFromUDP(buf[:])
+			if err != nil {
+				fmt.Println("Error occured when receiving data:", err.Error())
+				continue
+			}
+			msg := &Message{}
+			if err := json.Unmarshal(buf[:n], msg); err != nil {
+				continue
+			}
+			c.receiveMsg <- msg
 		}
-
-		n, _, err := c.conn.ReadFromUDP(buf[:])
-		if err != nil {
-			fmt.Println("Error occured when receiving data")
-			c.connLost <- true
-			return
-		}
-		msg := &Message{}
-		if err := json.Unmarshal(buf[:n], msg); err != nil {
-			continue
-		}
-		c.receiveMsg <- msg
 	}
 }
 
@@ -119,7 +138,7 @@ func (c *client) handleEvents() {
 					c.pendingRead = false
 					c.responseRead <- msg
 				} else {
-					c.inMsgQueue.PushBack(msg)
+					c.inMsgQueue.Offer(msg)
 				}
 				c.sendData(NewAck(c.connId, msg.SeqNum))
 			case MsgAck:
@@ -128,15 +147,33 @@ func (c *client) handleEvents() {
 					if !c.connected {
 						c.connected = true
 						c.connId = msg.ConnID
-						c.connAcked <- true
+						c.connSucceed <- true
 					}
 				}
 			}
+		case <-c.epochTicker.C:
+			c.epochCount++
+			if c.epochCount > c.params.EpochLimit {
+				// Limit reached
+				fmt.Println("Reach epoch limit.")
+				if !c.connected {
+					c.quitReceiveData <- true
+					c.connFail <- true
+					return
+				}
+				if c.pendingRead {
+					c.responseRead <- nil
+				}
+				c.connLost = true
+			}
+			if !c.connected {
+				c.sendData(NewConnect())
+			}
+
 		case <-c.requestRead:
 			if c.inMsgQueue.Len() > 0 {
-				head := c.inMsgQueue.Front()
-				c.inMsgQueue.Remove(head)
-				c.responseRead <- head.Value.(*Message)
+				msg := c.inMsgQueue.Poll()
+				c.responseRead <- msg
 			} else {
 				c.pendingRead = true
 			}
@@ -146,10 +183,8 @@ func (c *client) handleEvents() {
 			//c.outMsgQueue.PushBack(msg)
 			//fmt.Println("***Sending data: " + msg.String())
 			c.sendData(msg)
-		case <-c.connLost:
-			fmt.Println("Set the status to closed")
-			c.closed = true
 		case <-c.requestClose:
+			c.closed = true
 			c.readyToClose <- true
 		}
 	}
@@ -171,14 +206,23 @@ func (c *client) Read() ([]byte, error) {
 	if c.closed {
 		return nil, errors.New("Connection has been closed")
 	}
+	if c.connLost {
+		// Already timed out
+		return nil, errors.New("Connection is lost due to timeout")
+	}
 	c.requestRead <- true
 	msg := <-c.responseRead
-	return msg.Payload, nil
+	if msg != nil {
+		return msg.Payload, nil
+	} else {
+		// Timed out during waiting for message
+		return nil, errors.New("Connection is lost due to timeout")
+	}
 }
 
 func (c *client) Write(payload []byte) error {
-	if c.closed {
-		return errors.New("Connection has been closed")
+	if c.connLost {
+		return errors.New("Connection is lost due to timeout")
 	}
 	c.requestWrite <- payload
 	return nil
