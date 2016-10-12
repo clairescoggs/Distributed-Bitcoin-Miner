@@ -11,9 +11,9 @@ import (
 )
 
 type client struct {
-	params      *Params
 	connId      int
-	outSeqNum   int
+	readSeqNum  int // The next seq num of message returned to Read()
+	writeSeqNum int // The next seq num of message added by Write()
 	inMsgQueue  *msgQueue
 	outMsgQueue *msgQueue
 	serverAddr  *lspnet.UDPAddr
@@ -22,23 +22,25 @@ type client struct {
 	// Epoch
 	epochTicker *time.Ticker
 	epochCount  int
+	epochLimit  int
 
 	// Client Status
 	connected   bool
-	pendingRead bool // There is a Read request waiting to be responsed
+	pendingRead bool // A Read request is waiting to be responded
 	closed      bool // Explicitly closed
 	connLost    bool // Connection lost due to timeout
 
 	// Channels
-	connSucceed     chan bool
-	connFail        chan bool
-	receiveMsg      chan *Message
-	requestRead     chan bool
-	responseRead    chan *Message
-	requestWrite    chan []byte
-	requestClose    chan bool
-	readyToClose    chan bool
-	quitReceiveData chan bool
+	connSucceed      chan bool
+	connFail         chan bool
+	receiveMsg       chan *Message
+	requestRead      chan bool
+	responseRead     chan *Message
+	requestWrite     chan []byte
+	requestClose     chan bool
+	readyToClose     chan bool
+	quitReceiveData  chan bool
+	quitHandleEvents chan bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -53,28 +55,30 @@ type client struct {
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
 	c := client{
-		params:          params,
-		connId:          0,
-		outSeqNum:       0,
-		inMsgQueue:      NewQueue(params.WindowSize),
-		outMsgQueue:     NewQueue(params.WindowSize),
-		serverAddr:      nil,
-		conn:            nil,
-		epochTicker:     nil,
-		epochCount:      0,
-		connected:       false,
-		pendingRead:     false,
-		closed:          false,
-		connLost:        false,
-		connSucceed:     make(chan bool),
-		connFail:        make(chan bool),
-		receiveMsg:      make(chan *Message),
-		requestRead:     make(chan bool),
-		responseRead:    make(chan *Message),
-		requestWrite:    make(chan []byte),
-		requestClose:    make(chan bool),
-		readyToClose:    make(chan bool),
-		quitReceiveData: make(chan bool, 2),
+		connId:           0,
+		readSeqNum:       1,
+		writeSeqNum:      1,
+		inMsgQueue:       NewQueue(params.WindowSize),
+		outMsgQueue:      NewQueue(params.WindowSize),
+		serverAddr:       nil,
+		conn:             nil,
+		epochTicker:      nil,
+		epochCount:       0,
+		epochLimit:       params.EpochLimit,
+		connected:        false,
+		pendingRead:      false,
+		closed:           false,
+		connLost:         false,
+		connSucceed:      make(chan bool),
+		connFail:         make(chan bool),
+		receiveMsg:       make(chan *Message),
+		requestRead:      make(chan bool),
+		responseRead:     make(chan *Message),
+		requestWrite:     make(chan []byte),
+		requestClose:     make(chan bool),
+		readyToClose:     make(chan bool),
+		quitReceiveData:  make(chan bool),
+		quitHandleEvents: make(chan bool),
 	}
 
 	serverAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
@@ -101,13 +105,15 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	case <-c.connSucceed:
 		return &c, nil
 	case <-c.connFail:
+		c.quitReceiveData <- true
+		c.quitHandleEvents <- true
 		c.conn.Close()
 		return nil, errors.New("Timeout when trying to make connection")
 	}
 }
 
 func (c *client) receiveData() {
-	defer fmt.Println("Quit from receiveData()")
+	defer fmt.Println("Quit from receiveData")
 	var buf [2000]byte
 	for {
 		select {
@@ -116,7 +122,7 @@ func (c *client) receiveData() {
 		default:
 			n, _, err := c.conn.ReadFromUDP(buf[:])
 			if err != nil {
-				fmt.Println("Error occured when receiving data:", err.Error())
+				//fmt.Println("Error occured when receiving data:", err.Error())
 				continue
 			}
 			msg := &Message{}
@@ -129,18 +135,29 @@ func (c *client) receiveData() {
 }
 
 func (c *client) handleEvents() {
+	defer fmt.Println("Quit from handleEvents")
 	for {
 		select {
 		case msg := <-c.receiveMsg:
+			c.epochCount = 0
 			switch msg.Type {
 			case MsgData:
-				if c.pendingRead {
-					c.pendingRead = false
-					c.responseRead <- msg
-				} else {
-					c.inMsgQueue.Offer(msg)
+				// Reject message if size of the message is shorter than given size
+				if !c.connected || c.closed || len(msg.Payload) < msg.Size {
+					continue
 				}
 				c.sendData(NewAck(c.connId, msg.SeqNum))
+				// Truncate if size of message is longer than given size
+				if len(msg.Payload) > msg.Size {
+					msg.Payload = msg.Payload[:msg.Size]
+				}
+				c.inMsgQueue.Offer(msg)
+				if c.pendingRead && c.inMsgQueue.Peek().SeqNum == c.readSeqNum {
+					msg := c.inMsgQueue.Poll()
+					c.readSeqNum++
+					c.pendingRead = false
+					c.responseRead <- msg
+				}
 			case MsgAck:
 				//fmt.Println("***Received ack: " + msg.String())
 				if msg.SeqNum == 0 {
@@ -149,43 +166,70 @@ func (c *client) handleEvents() {
 						c.connId = msg.ConnID
 						c.connSucceed <- true
 					}
+				} else {
+					if c.outMsgQueue.SetAcked(msg.SeqNum) {
+						if exist, msgs := c.outMsgQueue.ForwardWindow(); exist {
+							for _, msg := range msgs {
+								c.sendData(msg)
+							}
+						}
+					}
 				}
 			}
 		case <-c.epochTicker.C:
 			c.epochCount++
-			if c.epochCount > c.params.EpochLimit {
-				// Limit reached
-				fmt.Println("Reach epoch limit.")
+			// Reach epoch limit
+			if c.epochCount > c.epochLimit {
 				if !c.connected {
-					c.quitReceiveData <- true
 					c.connFail <- true
-					return
+				} else if !c.connLost {
+					if c.pendingRead {
+						c.responseRead <- nil
+					}
+					c.connLost = true
 				}
-				if c.pendingRead {
-					c.responseRead <- nil
-				}
-				c.connLost = true
 			}
 			if !c.connected {
 				c.sendData(NewConnect())
+			} else {
+				// Check if can close
+				if c.closed && c.outMsgQueue.Len() == 0 {
+					if c.pendingRead {
+						c.responseRead <- nil
+					}
+					c.readyToClose <- true
+				}
+				// Hear nothing from server for at least 1 epoch
+				if c.epochCount > 1 {
+					c.sendData(NewAck(c.connId, 0))
+				}
+				// Send unacked message again
+				if exist, msgs := c.outMsgQueue.UnackedMsgs(); exist {
+					for _, msg := range msgs {
+						c.sendData(msg)
+					}
+				}
 			}
-
 		case <-c.requestRead:
-			if c.inMsgQueue.Len() > 0 {
+			if c.inMsgQueue.Len() > 0 && c.inMsgQueue.Peek().SeqNum == c.readSeqNum {
 				msg := c.inMsgQueue.Poll()
+				c.readSeqNum++
 				c.responseRead <- msg
 			} else {
 				c.pendingRead = true
 			}
 		case payload := <-c.requestWrite:
-			c.outSeqNum++
-			msg := NewData(c.connId, c.outSeqNum, len(payload), payload)
-			//c.outMsgQueue.PushBack(msg)
-			//fmt.Println("***Sending data: " + msg.String())
-			c.sendData(msg)
+			msg := NewData(c.connId, c.writeSeqNum, len(payload), payload)
+			c.outMsgQueue.Offer(msg)
+			// Send message out if within window size
+			if c.outMsgQueue.WithinWindow() {
+				c.sendData(msg)
+			}
+			c.writeSeqNum++
 		case <-c.requestClose:
 			c.closed = true
-			c.readyToClose <- true
+		case <-c.quitHandleEvents:
+			return
 		}
 	}
 }
@@ -229,8 +273,10 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	c.quitReceiveData <- true
 	c.requestClose <- true
 	<-c.readyToClose
+	c.quitReceiveData <- true
+	c.quitHandleEvents <- true
+	c.conn.Close()
 	return nil
 }
