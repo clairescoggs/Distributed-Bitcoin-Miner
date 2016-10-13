@@ -3,33 +3,13 @@
 package lsp
 
 import (
-	"container/list"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
 	"strconv"
+	"time"
 )
-
-type server struct {
-	currConnId         int
-	listener           *lspnet.UDPConn
-	closed             bool
-	addr2ConnId        map[string]int
-	connId2Addr        map[int]*lspnet.UDPAddr
-	connAlive          map[int]bool
-	outSeqNum          map[int]int
-	inMsgQueue         map[int]*list.List
-	receiveMsgFromAddr chan addrMsgBundle
-	requestRead        chan bool
-	pendingRead        bool
-	responseRead       chan *Message
-	requestWrite       chan idPayloadBundle
-	requestCloseConn   chan int
-	requestClose       chan bool
-	quitReceiveData    chan bool
-	readyToClose       chan bool
-}
 
 type addrMsgBundle struct {
 	addr *lspnet.UDPAddr
@@ -41,6 +21,38 @@ type idPayloadBundle struct {
 	payload []byte
 }
 
+type server struct {
+	conn       *lspnet.UDPConn
+	closed     bool
+	currConnId int
+	windowSize int
+
+	// Client status
+	addr2ConnId map[string]int
+	connId2Addr map[int]*lspnet.UDPAddr
+	connClosed  map[int]bool
+	readSeqNum  map[int]int
+	writeSeqNum map[int]int
+	inMsgQueue  map[int]*msgQueue
+	outMsgQueue map[int]*msgQueue
+
+	// Epoch
+	epochTicker *time.Ticker
+	epochCount  map[int]int
+	epochLimit  int
+
+	// Channels
+	receiveMsgFromAddr chan addrMsgBundle
+	requestRead        chan bool
+	pendingRead        bool
+	responseRead       chan *Message
+	requestWrite       chan idPayloadBundle
+	requestCloseConn   chan int
+	requestClose       chan bool
+	readyToClose       chan bool
+	quitReceiveData    chan bool
+}
+
 // NewServer creates, initiates, and returns a new server. This function should
 // NOT block. Instead, it should spawn one or more goroutines (to handle things
 // like accepting incoming client connections, triggering epoch events at
@@ -49,23 +61,29 @@ type idPayloadBundle struct {
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
 	s := server{
-		0,
-		nil,
-		false,
-		make(map[string]int),
-		make(map[int]*lspnet.UDPAddr),
-		make(map[int]bool),
-		make(map[int]int),
-		make(map[int]*list.List),
-		make(chan addrMsgBundle),
-		make(chan bool),
-		false,
-		make(chan *Message),
-		make(chan idPayloadBundle),
-		make(chan int),
-		make(chan bool),
-		make(chan bool),
-		make(chan bool),
+		conn:               nil,
+		closed:             false,
+		currConnId:         1,
+		windowSize:         params.WindowSize,
+		addr2ConnId:        make(map[string]int),
+		connId2Addr:        make(map[int]*lspnet.UDPAddr),
+		connClosed:         make(map[int]bool),
+		readSeqNum:         make(map[int]int),
+		writeSeqNum:        make(map[int]int),
+		inMsgQueue:         make(map[int]*msgQueue),
+		outMsgQueue:        make(map[int]*msgQueue),
+		epochTicker:        nil,
+		epochCount:         make(map[int]int),
+		epochLimit:         params.EpochLimit,
+		receiveMsgFromAddr: make(chan addrMsgBundle),
+		requestRead:        make(chan bool),
+		pendingRead:        false,
+		responseRead:       make(chan *Message),
+		requestWrite:       make(chan idPayloadBundle),
+		requestCloseConn:   make(chan int),
+		requestClose:       make(chan bool),
+		readyToClose:       make(chan bool),
+		quitReceiveData:    make(chan bool),
 	}
 	hostport := lspnet.JoinHostPort("localhost", strconv.Itoa(port))
 	addr, err := lspnet.ResolveUDPAddr("udp", hostport)
@@ -77,7 +95,8 @@ func NewServer(port int, params *Params) (Server, error) {
 		return nil, err
 	}
 
-	s.listener = conn
+	s.conn = conn
+	s.epochTicker = time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis))
 
 	go s.receiveData()
 	go s.handleEvents()
@@ -85,24 +104,23 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) receiveData() {
+	defer fmt.Println("Quit from receiveData")
 	var buf [2000]byte
 	for {
 		select {
 		case <-s.quitReceiveData:
-			fmt.Println("Quit from receiveData()")
 			return
 		default:
+			n, addr, err := s.conn.ReadFromUDP(buf[:])
+			if err != nil {
+				continue
+			}
+			msg := &Message{}
+			if err := json.Unmarshal(buf[:n], msg); err != nil {
+				continue
+			}
+			s.receiveMsgFromAddr <- addrMsgBundle{addr, msg}
 		}
-
-		n, addr, err := s.listener.ReadFromUDP(buf[:])
-		if err != nil {
-			continue
-		}
-		msg := &Message{}
-		if err := json.Unmarshal(buf[:n], msg); err != nil {
-			continue
-		}
-		s.receiveMsgFromAddr <- addrMsgBundle{addr, msg}
 	}
 }
 
@@ -118,34 +136,61 @@ func (s *server) handleEvents() {
 			switch msg.Type {
 			case MsgConnect:
 				if _, exist := s.addr2ConnId[addrStr]; !exist {
-					s.currConnId++
 					s.addr2ConnId[addrStr] = s.currConnId
 					s.connId2Addr[s.currConnId] = addr
-					s.connAlive[s.currConnId] = true
-					s.outSeqNum[s.currConnId] = 0
-					s.inMsgQueue[s.currConnId] = list.New()
+					s.connClosed[s.currConnId] = false
+					s.readSeqNum[s.currConnId] = 1
+					s.writeSeqNum[s.currConnId] = 1
+					s.inMsgQueue[s.currConnId] = NewQueue(s.windowSize)
+					s.outMsgQueue[s.currConnId] = NewQueue(s.windowSize)
+					s.epochCount[s.currConnId] = 0
+					s.currConnId++
 				}
 				s.sendDataToAddr(NewAck(s.addr2ConnId[addrStr], 0), addr)
 			case MsgData:
-				if clientId, exist := s.addr2ConnId[addrStr]; exist && s.connAlive[clientId] {
-					if s.pendingRead {
+				if id, exist := s.addr2ConnId[addrStr]; exist {
+					// Reject message if size of the message is shorter than given size
+					if s.closed || s.connClosed[id] || len(msg.Payload) < msg.Size {
+						continue
+					}
+					s.sendDataToAddr(NewAck(s.addr2ConnId[addrStr], msg.SeqNum), addr)
+					// Truncate if size of message is longer than given size
+					if len(msg.Payload) > msg.Size {
+						msg.Payload = msg.Payload[:msg.Size]
+					}
+					s.inMsgQueue[id].Offer(msg)
+					if s.pendingRead &&
+						s.inMsgQueue[id].Peek().SeqNum == s.readSeqNum[id] {
+						msg := s.inMsgQueue[id].Poll()
+						s.readSeqNum[id]++
 						s.pendingRead = false
 						s.responseRead <- msg
-					} else {
-						s.inMsgQueue[clientId].PushBack(msg)
 					}
+					s.epochCount[id] = 0
 				}
-				s.sendDataToAddr(NewAck(s.addr2ConnId[addrStr], msg.SeqNum), addr)
 			case MsgAck:
+				if id, exist := s.addr2ConnId[addrStr]; exist {
+					if s.outMsgQueue[id].SetAcked(msg.SeqNum) {
+						if exist, msgs := s.outMsgQueue[id].ForwardWindow(); exist {
+							for _, msg := range msgs {
+								s.sendDataToAddr(msg, addr)
+							}
+						}
+					}
+					s.epochCount[id] = 0
+				}
 			}
+		case <-s.epochTicker.C:
+
 		case <-s.requestRead:
 			available := false
-			for _, list := range s.inMsgQueue {
-				if list.Len() > 0 {
-					head := list.Front()
-					list.Remove(head)
+			for id, msgQueue := range s.inMsgQueue {
+				if !s.connClosed[id] &&
+					msgQueue.Len() > 0 && msgQueue.Peek().SeqNum == s.readSeqNum[id] {
+					msg := msgQueue.Poll()
 					available = true
-					s.responseRead <- head.Value.(*Message)
+					s.readSeqNum[id]++
+					s.responseRead <- msg
 					break
 				}
 			}
@@ -155,11 +200,14 @@ func (s *server) handleEvents() {
 		case bundle := <-s.requestWrite:
 			connId := bundle.connId
 			payload := bundle.payload
-			s.outSeqNum[connId]++
-			msg := NewData(connId, s.outSeqNum[connId], len(payload), payload)
-			s.sendDataToAddr(msg, s.connId2Addr[connId])
+			msg := NewData(connId, s.writeSeqNum[connId], len(payload), payload)
+			s.outMsgQueue[connId].Offer(msg)
+			if s.outMsgQueue[connId].WithinWindow() {
+				s.sendDataToAddr(msg, s.connId2Addr[connId])
+			}
+			s.writeSeqNum[connId]++
 		case id := <-s.requestCloseConn:
-			s.connAlive[id] = false
+			s.connClosed[id] = true
 		case <-s.requestClose:
 			s.closed = true
 			s.readyToClose <- true
@@ -168,8 +216,11 @@ func (s *server) handleEvents() {
 }
 
 func (s *server) sendDataToAddr(msg *Message, addr *lspnet.UDPAddr) error {
-	bytes, _ := json.Marshal(msg)
-	if _, err := s.listener.WriteToUDP(bytes, addr); err != nil {
+	bytes, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	if _, err := s.conn.WriteToUDP(bytes, addr); err != nil {
 		return err
 	}
 	return nil
@@ -185,7 +236,7 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) Write(connID int, payload []byte) error {
-	if !s.connAlive[connID] {
+	if s.connClosed[connID] {
 		return errors.New("Connection with client " + strconv.Itoa(connID) + " has lost")
 	}
 	s.requestWrite <- idPayloadBundle{connID, payload}
@@ -193,7 +244,7 @@ func (s *server) Write(connID int, payload []byte) error {
 }
 
 func (s *server) CloseConn(connID int) error {
-	if alive, exist := s.connAlive[connID]; !exist || !alive {
+	if closed, exist := s.connClosed[connID]; !exist || closed {
 		return errors.New("Connection with " + strconv.Itoa(connID) + " does not exist")
 	}
 	s.requestCloseConn <- connID
@@ -204,6 +255,6 @@ func (s *server) Close() error {
 	s.quitReceiveData <- true
 	s.requestClose <- true
 	<-s.readyToClose
-	s.listener.Close()
+	s.conn.Close()
 	return nil
 }
