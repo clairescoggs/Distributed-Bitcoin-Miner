@@ -5,7 +5,7 @@ package lsp
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
+	//"fmt"
 	"github.com/cmu440/lspnet"
 	"time"
 )
@@ -113,7 +113,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 }
 
 func (c *client) receiveData() {
-	defer fmt.Println("Client quit from receiveData")
 	var buf [2000]byte
 	for {
 		select {
@@ -136,7 +135,6 @@ func (c *client) receiveData() {
 }
 
 func (c *client) handleEvents() {
-	defer fmt.Println("Client quit from handleEvents")
 	for {
 		select {
 		case msg := <-c.receiveMsg:
@@ -179,12 +177,20 @@ func (c *client) handleEvents() {
 							}
 						}
 					}
+					// Check if can close
+					if c.closed && (c.outMsgQueue.Len() == 0 || c.connLost) {
+						if c.pendingRead {
+							c.pendingRead = false
+							c.responseRead <- nil
+						}
+						c.readyToClose <- true
+					}
 				}
 			}
 		case <-c.epochTicker.C:
 			c.epochCount++
 			// Reach epoch limit
-			if c.epochCount > c.epochLimit {
+			if c.epochCount >= c.epochLimit {
 				if !c.connected {
 					c.connFail <- true
 				} else if !c.connLost {
@@ -198,18 +204,17 @@ func (c *client) handleEvents() {
 			if !c.connected {
 				c.sendData(NewConnect())
 			} else {
+				// Hear nothing from server for at least 1 epoch
+				if c.epochCount > 1 {
+					c.sendData(NewAck(c.connId, 0))
+				}
 				// Check if can close
-				// fmt.Println("Check if can close", c.closed, c.outMsgQueue.Len(), c.pendingRead)
-				if c.closed && c.outMsgQueue.Len() == 0 {
+				if c.closed && (c.outMsgQueue.Len() == 0 || c.connLost) {
 					if c.pendingRead {
 						c.pendingRead = false
 						c.responseRead <- nil
 					}
 					c.readyToClose <- true
-				}
-				// Hear nothing from server for at least 1 epoch
-				if c.epochCount > 1 {
-					c.sendData(NewAck(c.connId, 0))
 				}
 				// Send unacked message again
 				if exist, msgs := c.outMsgQueue.UnackedMsgs(); exist {
@@ -238,7 +243,7 @@ func (c *client) handleEvents() {
 			c.writeSeqNum++
 		case <-c.requestClose:
 			c.closed = true
-			if c.outMsgQueue.Len() == 0 {
+			if c.outMsgQueue.Len() == 0 || c.connLost {
 				if c.pendingRead {
 					c.pendingRead = false
 					c.responseRead <- nil
