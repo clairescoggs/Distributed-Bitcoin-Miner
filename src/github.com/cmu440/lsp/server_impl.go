@@ -31,6 +31,7 @@ type server struct {
 	addr2ConnId map[string]int
 	connId2Addr map[int]*lspnet.UDPAddr
 	connClosed  map[int]bool
+	connLost    map[int]bool
 	readSeqNum  map[int]int
 	writeSeqNum map[int]int
 	inMsgQueue  map[int]*msgQueue
@@ -68,6 +69,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		addr2ConnId:        make(map[string]int),
 		connId2Addr:        make(map[int]*lspnet.UDPAddr),
 		connClosed:         make(map[int]bool),
+		connLost:           make(map[int]bool),
 		readSeqNum:         make(map[int]int),
 		writeSeqNum:        make(map[int]int),
 		inMsgQueue:         make(map[int]*msgQueue),
@@ -104,7 +106,7 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) receiveData() {
-	defer fmt.Println("Quit from receiveData")
+	defer fmt.Println("Server quit from receiveData")
 	var buf [2000]byte
 	for {
 		select {
@@ -119,6 +121,7 @@ func (s *server) receiveData() {
 			if err := json.Unmarshal(buf[:n], msg); err != nil {
 				continue
 			}
+			//fmt.Println("-S--Receive", msg.String(), "from", addr.String())
 			s.receiveMsgFromAddr <- addrMsgBundle{addr, msg}
 		}
 	}
@@ -131,14 +134,13 @@ func (s *server) handleEvents() {
 			addr := bundle.addr
 			addrStr := addr.String()
 			msg := bundle.msg
-			//fmt.Println(msg.String() + " from " + addr.String())
-
 			switch msg.Type {
 			case MsgConnect:
 				if _, exist := s.addr2ConnId[addrStr]; !exist {
 					s.addr2ConnId[addrStr] = s.currConnId
 					s.connId2Addr[s.currConnId] = addr
 					s.connClosed[s.currConnId] = false
+					s.connLost[s.currConnId] = false
 					s.readSeqNum[s.currConnId] = 1
 					s.writeSeqNum[s.currConnId] = 1
 					s.inMsgQueue[s.currConnId] = NewQueue(s.windowSize)
@@ -154,6 +156,10 @@ func (s *server) handleEvents() {
 						continue
 					}
 					s.sendDataToAddr(NewAck(s.addr2ConnId[addrStr], msg.SeqNum), addr)
+					// Discard message that has already been read before
+					if msg.SeqNum < s.readSeqNum[id] {
+						continue
+					}
 					// Truncate if size of message is longer than given size
 					if len(msg.Payload) > msg.Size {
 						msg.Payload = msg.Payload[:msg.Size]
@@ -181,7 +187,26 @@ func (s *server) handleEvents() {
 				}
 			}
 		case <-s.epochTicker.C:
-
+			for id, _ := range s.connId2Addr {
+				s.epochCount[id]++
+				if !s.connLost[id] && s.epochCount[id] > s.epochLimit {
+					s.connLost[id] = true
+					if s.pendingRead {
+						// Return an error to the Read() request indicating that this client is lost
+						s.pendingRead = false
+						s.responseRead <- NewData(id, 0, 0, nil)
+					}
+				}
+				if s.epochCount[id] > 1 {
+					s.sendDataToAddr(NewAck(id, 0), s.connId2Addr[id])
+				}
+				// Send all unacked messages
+				if exist, msgs := s.outMsgQueue[id].UnackedMsgs(); exist {
+					for _, msg := range msgs {
+						s.sendDataToAddr(msg, s.connId2Addr[id])
+					}
+				}
+			}
 		case <-s.requestRead:
 			available := false
 			for id, msgQueue := range s.inMsgQueue {
@@ -195,6 +220,7 @@ func (s *server) handleEvents() {
 				}
 			}
 			if !available {
+				//fmt.Println("Pending Read")
 				s.pendingRead = true
 			}
 		case bundle := <-s.requestWrite:
@@ -223,15 +249,21 @@ func (s *server) sendDataToAddr(msg *Message, addr *lspnet.UDPAddr) error {
 	if _, err := s.conn.WriteToUDP(bytes, addr); err != nil {
 		return err
 	}
+	//fmt.Println("-S--Sent   ", msg.String(), "to", addr.String())
 	return nil
 }
 
 func (s *server) Read() (int, []byte, error) {
+	//fmt.Println("Read start")
 	if s.closed {
 		return 0, nil, errors.New("Server has been closed")
 	}
 	s.requestRead <- true
 	msg := <-s.responseRead
+	if msg.Payload == nil {
+		return 0, nil, errors.New(fmt.Sprintf("Client %d is lost due to time out", msg.ConnID))
+	}
+	//fmt.Println("Read end")
 	return msg.ConnID, msg.Payload, nil
 }
 

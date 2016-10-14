@@ -113,7 +113,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 }
 
 func (c *client) receiveData() {
-	defer fmt.Println("Quit from receiveData")
+	defer fmt.Println("Client quit from receiveData")
 	var buf [2000]byte
 	for {
 		select {
@@ -129,13 +129,14 @@ func (c *client) receiveData() {
 			if err := json.Unmarshal(buf[:n], msg); err != nil {
 				continue
 			}
+			//fmt.Println("--C-Receive", msg.String())
 			c.receiveMsg <- msg
 		}
 	}
 }
 
 func (c *client) handleEvents() {
-	defer fmt.Println("Quit from handleEvents")
+	defer fmt.Println("Client quit from handleEvents")
 	for {
 		select {
 		case msg := <-c.receiveMsg:
@@ -147,6 +148,10 @@ func (c *client) handleEvents() {
 					continue
 				}
 				c.sendData(NewAck(c.connId, msg.SeqNum))
+				// Discard message that has already been read before
+				if msg.SeqNum < c.readSeqNum {
+					continue
+				}
 				// Truncate if size of message is longer than given size
 				if len(msg.Payload) > msg.Size {
 					msg.Payload = msg.Payload[:msg.Size]
@@ -184,6 +189,7 @@ func (c *client) handleEvents() {
 					c.connFail <- true
 				} else if !c.connLost {
 					if c.pendingRead {
+						c.pendingRead = false
 						c.responseRead <- nil
 					}
 					c.connLost = true
@@ -193,8 +199,10 @@ func (c *client) handleEvents() {
 				c.sendData(NewConnect())
 			} else {
 				// Check if can close
+				// fmt.Println("Check if can close", c.closed, c.outMsgQueue.Len(), c.pendingRead)
 				if c.closed && c.outMsgQueue.Len() == 0 {
 					if c.pendingRead {
+						c.pendingRead = false
 						c.responseRead <- nil
 					}
 					c.readyToClose <- true
@@ -215,8 +223,10 @@ func (c *client) handleEvents() {
 				msg := c.inMsgQueue.Poll()
 				c.readSeqNum++
 				c.responseRead <- msg
+				//fmt.Println("Client requesting read return directly")
 			} else {
 				c.pendingRead = true
+				//fmt.Println("Client requesting read pending")
 			}
 		case payload := <-c.requestWrite:
 			msg := NewData(c.connId, c.writeSeqNum, len(payload), payload)
@@ -228,6 +238,13 @@ func (c *client) handleEvents() {
 			c.writeSeqNum++
 		case <-c.requestClose:
 			c.closed = true
+			if c.outMsgQueue.Len() == 0 {
+				if c.pendingRead {
+					c.pendingRead = false
+					c.responseRead <- nil
+				}
+				c.readyToClose <- true
+			}
 		case <-c.quitHandleEvents:
 			return
 		}
@@ -239,6 +256,7 @@ func (c *client) sendData(msg *Message) error {
 	if _, err := c.conn.Write(bytes); err != nil {
 		return err
 	}
+	//fmt.Println("--C-Sent   ", msg.String())
 	return nil
 }
 
@@ -256,6 +274,7 @@ func (c *client) Read() ([]byte, error) {
 	}
 	c.requestRead <- true
 	msg := <-c.responseRead
+	//fmt.Println("Client got something from read")
 	if msg != nil {
 		return msg.Payload, nil
 	} else {
@@ -275,8 +294,8 @@ func (c *client) Write(payload []byte) error {
 func (c *client) Close() error {
 	c.requestClose <- true
 	<-c.readyToClose
+	c.conn.Close()
 	c.quitReceiveData <- true
 	c.quitHandleEvents <- true
-	c.conn.Close()
 	return nil
 }
