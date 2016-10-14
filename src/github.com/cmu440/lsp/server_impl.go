@@ -5,7 +5,6 @@ package lsp
 import (
 	"encoding/json"
 	"errors"
-	//"fmt"
 	"github.com/cmu440/lspnet"
 	"strconv"
 	"time"
@@ -128,7 +127,6 @@ func (s *server) receiveData() {
 			if err := json.Unmarshal(buf[:n], msg); err != nil {
 				continue
 			}
-			//fmt.Println("-S--Receive", msg.String(), "from", addr.String())
 			s.receiveMsgFromAddr <- addrMsgBundle{addr, msg}
 		}
 	}
@@ -150,8 +148,8 @@ func (s *server) handleEvents() {
 					s.connLost[s.currConnId] = false
 					s.readSeqNum[s.currConnId] = 1
 					s.writeSeqNum[s.currConnId] = 1
-					s.inMsgQueue[s.currConnId] = NewQueue(s.windowSize)
-					s.outMsgQueue[s.currConnId] = NewQueue(s.windowSize)
+					s.inMsgQueue[s.currConnId] = newQueue(s.windowSize)
+					s.outMsgQueue[s.currConnId] = newQueue(s.windowSize)
 					s.epochCount[s.currConnId] = 0
 					s.currConnId++
 				}
@@ -294,7 +292,6 @@ func (s *server) sendDataToAddr(msg *Message, addr *lspnet.UDPAddr) error {
 	if _, err := s.conn.WriteToUDP(bytes, addr); err != nil {
 		return err
 	}
-	//fmt.Println("-S--Sent   ", msg.String(), "to", addr.String())
 	return nil
 }
 

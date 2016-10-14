@@ -5,19 +5,17 @@ package lsp
 import (
 	"encoding/json"
 	"errors"
-	//"fmt"
 	"github.com/cmu440/lspnet"
 	"time"
 )
 
 type client struct {
+	conn        *lspnet.UDPConn
 	connId      int
 	readSeqNum  int // The next seq num of message returned to Read()
 	writeSeqNum int // The next seq num of message added by Write()
 	inMsgQueue  *msgQueue
 	outMsgQueue *msgQueue
-	serverAddr  *lspnet.UDPAddr
-	conn        *lspnet.UDPConn
 
 	// Epoch
 	epochTicker *time.Ticker
@@ -55,13 +53,12 @@ type client struct {
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
 	c := client{
+		conn:             nil,
 		connId:           0,
 		readSeqNum:       1,
 		writeSeqNum:      1,
-		inMsgQueue:       NewQueue(params.WindowSize),
-		outMsgQueue:      NewQueue(params.WindowSize),
-		serverAddr:       nil,
-		conn:             nil,
+		inMsgQueue:       newQueue(params.WindowSize),
+		outMsgQueue:      newQueue(params.WindowSize),
 		epochTicker:      nil,
 		epochCount:       0,
 		epochLimit:       params.EpochLimit,
@@ -89,7 +86,6 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.serverAddr = serverAddr
 	c.conn = conn
 
 	if err := c.sendData(NewConnect()); err != nil {
@@ -121,14 +117,12 @@ func (c *client) receiveData() {
 		default:
 			n, _, err := c.conn.ReadFromUDP(buf[:])
 			if err != nil {
-				//fmt.Println("Error occured when receiving data:", err.Error())
 				continue
 			}
 			msg := &Message{}
 			if err := json.Unmarshal(buf[:n], msg); err != nil {
 				continue
 			}
-			//fmt.Println("--C-Receive", msg.String())
 			c.receiveMsg <- msg
 		}
 	}
@@ -162,7 +156,6 @@ func (c *client) handleEvents() {
 					c.responseRead <- msg
 				}
 			case MsgAck:
-				//fmt.Println("***Received ack: " + msg.String())
 				if msg.SeqNum == 0 {
 					if !c.connected {
 						c.connected = true
@@ -178,12 +171,8 @@ func (c *client) handleEvents() {
 						}
 					}
 					// Check if can close
-					if c.closed && (c.outMsgQueue.Len() == 0 || c.connLost) {
-						if c.pendingRead {
-							c.pendingRead = false
-							c.responseRead <- nil
-						}
-						c.readyToClose <- true
+					if c.closed {
+						c.closeIfReady()
 					}
 				}
 			}
@@ -209,12 +198,8 @@ func (c *client) handleEvents() {
 					c.sendData(NewAck(c.connId, 0))
 				}
 				// Check if can close
-				if c.closed && (c.outMsgQueue.Len() == 0 || c.connLost) {
-					if c.pendingRead {
-						c.pendingRead = false
-						c.responseRead <- nil
-					}
-					c.readyToClose <- true
+				if c.closed {
+					c.closeIfReady()
 				}
 				// Send unacked message again
 				if exist, msgs := c.outMsgQueue.UnackedMsgs(); exist {
@@ -228,10 +213,8 @@ func (c *client) handleEvents() {
 				msg := c.inMsgQueue.Poll()
 				c.readSeqNum++
 				c.responseRead <- msg
-				//fmt.Println("Client requesting read return directly")
 			} else {
 				c.pendingRead = true
-				//fmt.Println("Client requesting read pending")
 			}
 		case payload := <-c.requestWrite:
 			msg := NewData(c.connId, c.writeSeqNum, len(payload), payload)
@@ -243,13 +226,7 @@ func (c *client) handleEvents() {
 			c.writeSeqNum++
 		case <-c.requestClose:
 			c.closed = true
-			if c.outMsgQueue.Len() == 0 || c.connLost {
-				if c.pendingRead {
-					c.pendingRead = false
-					c.responseRead <- nil
-				}
-				c.readyToClose <- true
-			}
+			c.closeIfReady()
 		case <-c.quitHandleEvents:
 			return
 		}
@@ -261,8 +238,17 @@ func (c *client) sendData(msg *Message) error {
 	if _, err := c.conn.Write(bytes); err != nil {
 		return err
 	}
-	//fmt.Println("--C-Sent   ", msg.String())
 	return nil
+}
+
+func (c *client) closeIfReady() {
+	if c.outMsgQueue.Len() == 0 || c.connLost {
+		if c.pendingRead {
+			c.pendingRead = false
+			c.responseRead <- nil
+		}
+		c.readyToClose <- true
+	}
 }
 
 func (c *client) ConnID() int {
@@ -279,7 +265,6 @@ func (c *client) Read() ([]byte, error) {
 	}
 	c.requestRead <- true
 	msg := <-c.responseRead
-	//fmt.Println("Client got something from read")
 	if msg != nil {
 		return msg.Payload, nil
 	} else {

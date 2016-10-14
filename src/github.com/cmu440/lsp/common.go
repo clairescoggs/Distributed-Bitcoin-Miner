@@ -14,7 +14,8 @@ type node struct {
 	acked bool
 }
 
-func NewQueue(windowSize int) *msgQueue {
+// Create and return a new queue holding all messages ordered by sequence number
+func newQueue(windowSize int) *msgQueue {
 	return &msgQueue{
 		list.New(),
 		windowSize,
@@ -66,6 +67,7 @@ func (q *msgQueue) WithinWindow() bool {
 	return q.list.Len() <= q.windowSize
 }
 
+// Return all messages in the window that has not yet been acked
 func (q *msgQueue) UnackedMsgs() (bool, []*Message) {
 	numUnacked := 0
 	for i, e := 0, q.list.Front(); i < q.windowSize && e != nil; i++ {
