@@ -42,6 +42,7 @@ type server struct {
 	epochTicker *time.Ticker
 	epochCount  map[int]int
 	epochLimit  int
+	epochNoData map[int]bool
 
 	// Channels
 	receiveMsgFromAddr chan addrMsgBundle
@@ -82,6 +83,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		epochTicker:        nil,
 		epochCount:         make(map[int]int),
 		epochLimit:         params.EpochLimit,
+		epochNoData:        make(map[int]bool),
 		receiveMsgFromAddr: make(chan addrMsgBundle),
 		requestRead:        make(chan bool),
 		responseRead:       make(chan *Message),
@@ -177,6 +179,7 @@ func (s *server) handleEvents() {
 						s.responseRead <- msg
 					}
 					s.epochCount[id] = 0
+					s.epochNoData[id] = false
 				}
 			case MsgAck:
 				if id, exist := s.addr2ConnId[addrStr]; exist {
@@ -205,7 +208,8 @@ func (s *server) handleEvents() {
 		case <-s.epochTicker.C:
 			for id, _ := range s.connId2Addr {
 				s.epochCount[id]++
-				if !s.connLost[id] && s.epochCount[id] > s.epochLimit {
+				// Reach epoch limit
+				if !s.connLost[id] && s.epochCount[id] >= s.epochLimit {
 					s.connLost[id] = true
 					if s.closed {
 						s.safelyClosed = false
@@ -217,9 +221,11 @@ func (s *server) handleEvents() {
 						break
 					}
 				}
-				if s.epochCount[id] > 1 {
+				// Hear nothing or receive no data for at least 1 epoch
+				if s.epochNoData[id] || s.epochCount[id] >= 1 {
 					s.sendDataToAddr(NewAck(id, 0), s.connId2Addr[id])
 				}
+				s.epochNoData[id] = true
 				// Send all unacked messages
 				if exist, msgs := s.outMsgQueue[id].UnackedMsgs(); exist {
 					for _, msg := range msgs {
@@ -235,6 +241,7 @@ func (s *server) handleEvents() {
 					}
 					s.deleteClient(id)
 				}
+				// Check if server can close
 				if s.closed {
 					s.closeIfReady()
 				}
@@ -306,6 +313,7 @@ func (s *server) deleteClient(id int) {
 	delete(s.inMsgQueue, id)
 	delete(s.outMsgQueue, id)
 	delete(s.epochCount, id)
+	delete(s.epochNoData, id)
 }
 
 func (s *server) closeIfReady() {

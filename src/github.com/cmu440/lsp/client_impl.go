@@ -21,6 +21,7 @@ type client struct {
 	epochTicker *time.Ticker
 	epochCount  int
 	epochLimit  int
+	epochNoData bool // No message of type data has been received
 
 	// Client Status
 	connected   bool
@@ -62,6 +63,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		epochTicker:      nil,
 		epochCount:       0,
 		epochLimit:       params.EpochLimit,
+		epochNoData:      false,
 		connected:        false,
 		pendingRead:      false,
 		closed:           false,
@@ -155,6 +157,7 @@ func (c *client) handleEvents() {
 					c.pendingRead = false
 					c.responseRead <- msg
 				}
+				c.epochNoData = false
 			case MsgAck:
 				if msg.SeqNum == 0 {
 					if !c.connected {
@@ -193,19 +196,20 @@ func (c *client) handleEvents() {
 			if !c.connected {
 				c.sendData(NewConnect())
 			} else {
-				// Hear nothing from server for at least 1 epoch
-				if c.epochCount > 1 {
+				// Hear nothing or receive no data from server for at least 1 epoch
+				if c.epochNoData || c.epochCount > 1 {
 					c.sendData(NewAck(c.connId, 0))
 				}
-				// Check if can close
-				if c.closed {
-					c.closeIfReady()
-				}
-				// Send unacked message again
+				c.epochNoData = true
+				// Send unacked messages
 				if exist, msgs := c.outMsgQueue.UnackedMsgs(); exist {
 					for _, msg := range msgs {
 						c.sendData(msg)
 					}
+				}
+				// Check if can close
+				if c.closed {
+					c.closeIfReady()
 				}
 			}
 		case <-c.requestRead:
