@@ -10,7 +10,7 @@ import (
 	"strconv"
 )
 
-const maxJobSize = 5000
+const maxJobSize = 4000
 
 type idMsgBundle struct {
 	id  int
@@ -24,7 +24,8 @@ type job struct {
 	maxNonce uint64
 }
 
-type progress struct {
+// Storing the progress and result of each client request
+type request struct {
 	jobsRemain int
 	minHash    uint64
 	nonce      uint64
@@ -34,7 +35,7 @@ type server struct {
 	lspServer  lsp.Server
 	jobQueue   *list.List
 	miners     map[int]*job
-	clients    map[int]progress
+	clients    map[int]*request
 	receiveMsg chan idMsgBundle
 	connLost   chan int
 }
@@ -49,7 +50,7 @@ func startServer(port int) (*server, error) {
 		lspServer:  lspserver,
 		jobQueue:   list.New(),
 		miners:     make(map[int]*job),
-		clients:    make(map[int]progress),
+		clients:    make(map[int]*request),
 		receiveMsg: make(chan idMsgBundle),
 		connLost:   make(chan int),
 	}
@@ -93,10 +94,28 @@ func (s *server) handleMessage() {
 			case bitcoin.Join:
 				if _, exist := s.miners[id]; !exist {
 					s.miners[id] = nil
-					fmt.Println("new miner joined")
+					s.dispatchJobsToMiners()
 				}
 			case bitcoin.Request:
+				fmt.Println(msg)
+				s.addJob(id, msg)
+				s.dispatchJobsToMiners()
 			case bitcoin.Result:
+				clientId := s.miners[id].clientid
+				clientJob := s.clients[clientId]
+				clientJob.jobsRemain--
+				if msg.Hash < s.clients[clientId].minHash {
+					clientJob.minHash = msg.Hash
+					clientJob.nonce = msg.Nonce
+				}
+				s.miners[id] = nil
+				s.dispatchJobsToMiners()
+				// Has finished client's job. Return result to client
+				if clientJob.jobsRemain == 0 {
+					s.sendMessage(clientId, bitcoin.NewResult(clientJob.minHash, clientJob.nonce))
+					s.lspServer.CloseConn(clientId)
+					delete(s.clients, clientId)
+				}
 			}
 		case id := <-s.connLost:
 			fmt.Println(id, "is lost")
@@ -128,4 +147,41 @@ func (s *server) sendMessage(id int, msg *bitcoin.Message) error {
 		return err
 	}
 	return nil
+}
+
+func (s *server) addJob(id int, task *bitcoin.Message) {
+	newRequest := &request{0, ^uint64(0), uint64(0)}
+	lower, upper := task.Lower, task.Lower+maxJobSize-1
+
+	for upper < task.Upper {
+		newRequest.jobsRemain++
+		s.jobQueue.PushBack(job{id, task.Data, lower, upper})
+		lower = upper + 1
+		upper = lower + maxJobSize - 1
+	}
+	newRequest.jobsRemain++
+	s.jobQueue.PushBack(job{id, task.Data, lower, task.Upper})
+	s.clients[id] = newRequest
+}
+
+func (s *server) findIdleMiner() (int, bool) {
+	for minerId, job := range s.miners {
+		if job == nil {
+			return minerId, true
+		}
+	}
+	return 0, false
+}
+
+func (s *server) dispatchJobsToMiners() {
+	for s.jobQueue.Len() > 0 {
+		if minerId, exist := s.findIdleMiner(); exist {
+			job := s.jobQueue.Front().Value.(job)
+			s.jobQueue.Remove(s.jobQueue.Front())
+			s.miners[minerId] = &job
+			s.sendMessage(minerId, bitcoin.NewRequest(job.message, job.minNonce, job.maxNonce))
+		} else {
+			break
+		}
+	}
 }
