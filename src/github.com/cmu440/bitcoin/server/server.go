@@ -1,3 +1,11 @@
+// The scheduling strategy of the server is as follows:
+// 1. The server maintains a queue of jobs to be done
+// 2. When a request comes from a client, split the request into multiple sub-jobs,
+//    each job has a maximum job size limit. Append all sub-jobs to the job queue
+// 3. Whenever a miner becomes idle or new miner is joined, take a new job from the
+//    job queue
+// 4. Whenever a miner is lost, its job is prepended back to the job queue, waiting
+//    for the next available miner to take over the job
 package main
 
 import (
@@ -45,7 +53,6 @@ func startServer(port int) (*server, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	srv := &server{
 		lspServer:  lspserver,
 		jobQueue:   list.New(),
@@ -92,34 +99,38 @@ func (s *server) handleMessage() {
 			msg := bundle.msg
 			switch msg.Type {
 			case bitcoin.Join:
-				if _, exist := s.miners[id]; !exist {
-					s.miners[id] = nil
-					s.dispatchJobsToMiners()
-				}
+				s.miners[id] = nil // Add a miner to the miner pool
 			case bitcoin.Request:
-				fmt.Println(msg)
 				s.addJob(id, msg)
-				s.dispatchJobsToMiners()
 			case bitcoin.Result:
 				clientId := s.miners[id].clientid
-				clientJob := s.clients[clientId]
-				clientJob.jobsRemain--
-				if msg.Hash < s.clients[clientId].minHash {
-					clientJob.minHash = msg.Hash
-					clientJob.nonce = msg.Nonce
-				}
 				s.miners[id] = nil
-				s.dispatchJobsToMiners()
-				// Has finished client's job. Return result to client
-				if clientJob.jobsRemain == 0 {
-					s.sendMessage(clientId, bitcoin.NewResult(clientJob.minHash, clientJob.nonce))
-					s.lspServer.CloseConn(clientId)
-					delete(s.clients, clientId)
+
+				if clientJob, exist := s.clients[clientId]; exist {
+					clientJob.jobsRemain--
+					if msg.Hash < s.clients[clientId].minHash {
+						clientJob.minHash = msg.Hash
+						clientJob.nonce = msg.Nonce
+					}
+					// Client's job finished. Return result to client
+					if clientJob.jobsRemain == 0 {
+						s.sendMessage(clientId, bitcoin.NewResult(clientJob.minHash, clientJob.nonce))
+						s.lspServer.CloseConn(clientId)
+						delete(s.clients, clientId)
+					}
 				}
 			}
 		case id := <-s.connLost:
-			fmt.Println(id, "is lost")
+			if _, exist := s.clients[id]; exist {
+				delete(s.clients, id)
+			} else if job, exist := s.miners[id]; exist {
+				if job != nil {
+					s.jobQueue.PushFront(*job)
+				}
+				delete(s.miners, id)
+			}
 		}
+		s.dispatchJobsToMiners()
 	}
 }
 
@@ -175,13 +186,15 @@ func (s *server) findIdleMiner() (int, bool) {
 
 func (s *server) dispatchJobsToMiners() {
 	for s.jobQueue.Len() > 0 {
-		if minerId, exist := s.findIdleMiner(); exist {
-			job := s.jobQueue.Front().Value.(job)
-			s.jobQueue.Remove(s.jobQueue.Front())
-			s.miners[minerId] = &job
-			s.sendMessage(minerId, bitcoin.NewRequest(job.message, job.minNonce, job.maxNonce))
-		} else {
-			break
+		job := s.jobQueue.Front().Value.(job)
+		if _, exist := s.clients[job.clientid]; exist {
+			if minerId, exist := s.findIdleMiner(); exist {
+				s.miners[minerId] = &job
+				s.sendMessage(minerId, bitcoin.NewRequest(job.message, job.minNonce, job.maxNonce))
+			} else {
+				return
+			}
 		}
+		s.jobQueue.Remove(s.jobQueue.Front())
 	}
 }
